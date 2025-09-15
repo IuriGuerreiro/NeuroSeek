@@ -1,0 +1,7 @@
+
+uri = "mongodb://localhost:27018"
+db = "SearchEngine"
+
+
+threads=500
+batch_size=1000
