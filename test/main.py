@@ -27,6 +27,12 @@ webpage_processing_queue = multiprocessing.JoinableQueue()
 #queues for storing intermediate results
 webpage_queue = multiprocessing.JoinableQueue()
 
+# Sets to track URLs that have been added to queues to prevent duplicates
+task_urls_added = set()
+processing_urls_added = set()
+webpage_urls_added = set()
+url_tracking_lock = multiprocessing.Lock()
+
 def worker(webpage_processing_queue, webpage_queue):
     print(f"Worker {multiprocessing.current_process().name} started")
     while True:
@@ -47,6 +53,10 @@ def worker(webpage_processing_queue, webpage_queue):
                         import pickle
                         pickle.dumps(webpage)
                         webpage_queue.put(webpage)
+                        # Update URL tracking
+                        with url_tracking_lock:
+                            processing_urls_added.discard(webpage_item.url)
+                            webpage_urls_added.add(webpage_item.url)
                         print(f"Worker processed: {webpage_item.url}")
                     except Exception as queue_error:
                         print(f"Queue serialization error for {webpage_item.url}: {type(queue_error).__name__} - {str(queue_error)[:200]}")
@@ -90,6 +100,10 @@ def thread_worker(task_queue, webpage_processing_queue):
                         status_code=response.status_code
                     )
                     webpage_processing_queue.put(webpageQueueItem)
+                    # Update URL tracking
+                    with url_tracking_lock:
+                        task_urls_added.discard(url)
+                        processing_urls_added.add(url)
                     print(f"{thread_name} successfully queued {url}")
                 else:
                     print(f"{thread_name} skipping {url} - invalid response")
@@ -124,67 +138,92 @@ def process_url(webpage_content, status_code, url, redirectLink):
     return None
 
 def task_manager_process(task_queue):
+    limit = config.get("limit", 1000)
     db = mongo.connect_to_mongo()
     while True:
         try:
             # Check for new tasks from the database
-            new_tasks = mongo.get_waiting_tasks(db)
+            new_tasks = mongo.get_waiting_tasks(db, limit=limit)
             if not new_tasks:
                 # If no new tasks, check for start URLs
                 new_tasks = StartUrls
-
+            urlsToRemove = []
             for task_url in new_tasks:
                 url = task_url.get("url") if isinstance(task_url, dict) else task_url
                 if not mongo.check_url_exists(db, url):
                     if url.startswith(('http://', 'https://')):
-                        task_queue.put(url)
+                        # Use thread-safe sets to check for duplicates instead of accessing .queue
+                        with url_tracking_lock:
+                            if url not in task_urls_added and url not in processing_urls_added and url not in webpage_urls_added:
+                                task_queue.put(url)
+                                task_urls_added.add(url)
                     else:
                         print(f"Skipping invalid URL: {url}")
+                        urlsToRemove.append(url)
+            if urlsToRemove:
+                mongo.remove_tasks(db, urlsToRemove)
             
             # Check for new tasks every 10 seconds (or adjust as needed)
             print(f"Task queue size: {task_queue.qsize()}")
             if task_queue.qsize() < batchSize:
                 time.sleep(1)
             else:
-                time.sleep(30)
+                time.sleep(1)
         except Exception as e:
             print(f"Task manager process error: {e}")
             time.sleep(60) # Sleep longer on error to prevent tight loops
 
 def databases_manager_process(webpage_queue, task_queue):
     db = mongo.connect_to_mongo()
+    
     while True:
         try:
-            if not webpage_queue.empty():
-                if webpage_queue.qsize() >= batchSize or task_queue.qsize() < batchSize:
-                        print(f"Database manager processing batch of {batchSize} webpages")
-                        print(f"Webpage queue size before processing: {webpage_queue.qsize()}")
-                        print("aaaaaaaaaaaaaaaaaa")
-                        batch = []
-                        for _ in range(batchSize):
-                            if not webpage_queue.empty():
-                                batch.append(webpage_queue.get())
-                        mongo.insert_many_webpages(db, batch)
-
-                        # create tasks for extracted urls
-                        extracted_urls = []
-                        for webpage in batch:
-                            for url in webpage.extracted_urls:
-                                extracted_urls.append(url)
-
+            print(f"Database manager webpage queue size: {webpage_queue.qsize()}")
+            if webpage_queue.qsize() >= batchSize or (webpage_queue.qsize() > 0 and task_queue.qsize() < batchSize):
+                print(f"Webpage queue size before processing: {webpage_queue.qsize()}")
+                # Process available items up to batchSize
+                batch = []
+                processed_urls = []
+                
+                items_to_process = min(batchSize, webpage_queue.qsize())
+                while not webpage_queue.empty():
+                    try:
+                        webpage = webpage_queue.get_nowait()  # Non-blocking get
+                        batch.append(webpage)
+                        processed_urls.append(webpage.url)
+                    except queue.Empty:
+                        break  # Queue became empty while processing
+                
+                if batch:
+                    print(f"Processing batch of {len(batch)} webpages")
+                    
+                    # Bulk database operations
+                    mongo.insert_many_webpages(db, batch)
+                    
+                    # Extract URLs and create tasks in bulk
+                    extracted_urls = []
+                    for webpage in batch:
+                        if hasattr(webpage, 'extracted_urls'):
+                            extracted_urls.extend(webpage.extracted_urls)
+                    
+                    if extracted_urls:
                         mongo.create_many_tasks(db, extracted_urls)
-
-                        urls = []
-                        for webpage in batch:
-                            urls.append(webpage.url)
-                        mongo.remove_tasks(db, urls) 
+                    
+                    # Clean up tasks
+                    if processed_urls:
+                        mongo.remove_tasks(db, processed_urls)
+                    
+                    # Clean up URL tracking
+                    with url_tracking_lock:
+                        for url in processed_urls:
+                            webpage_urls_added.discard(url)
+                else:
+                    print("Database manager waiting for more webpages")
             time.sleep(1)
-
+            
         except Exception as e:
-            print(f"Database manager process error: {e}")
-            time.sleep(5)  # Sleep longer on error to prevent tight loops
-
-
+            print(f"Database manager error: {e}")
+            time.sleep(5)
 
 
 def worker_threads_process(task_queue, webpage_processing_queue):

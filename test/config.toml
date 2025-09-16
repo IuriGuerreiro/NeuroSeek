@@ -2,8 +2,9 @@
 uri = "mongodb://localhost:27018"
 db = "SearchEngine"
 
-multiprocess=10
+multiprocess=100
 
-multiprocessForThreads=1
-threads=1
-batch_size=10
+multiprocessForThreads=3
+threads=33
+batch_size=100
+limit=10000
