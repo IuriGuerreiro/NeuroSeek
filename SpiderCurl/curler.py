@@ -10,13 +10,24 @@ def fetch_url(url):
             }
             response = client.get(url, headers=headers)
             response.raise_for_status()
+            
+            # Check if the response is HTML - if not, skip it
+            content_type = response.headers.get('Content-Type', '').lower()
+            if not (content_type.startswith('text/html') or 
+                    content_type.startswith('application/xhtml') or 
+                    content_type.startswith('application/xml') or
+                    'text/' in content_type):
+                print(f"Skipping non-HTML URL: {url} (Content-Type: {content_type})")
+                return False, None, None
+            
             return False, response, None
         except httpx.HTTPStatusError as e:
             # Handle HTTP errors (4xx, 5xx)
             if e.response.status_code == 301 or e.response.status_code == 302:
                 redirect_url = e.response.headers.get("Location")
                 if redirect_url:
-                    return fetch_url(redirect_url)  # Recursively follow redirect
+                    doesnt, response, matter = fetch_url(redirect_url)  # Recursively follow redirect
+                    return True, response, redirect_url
             print(f"HTTP {e.response.status_code} error for {url}")
             return False, None, None
         except (httpx.UnsupportedProtocol, httpx.ReadTimeout, httpx.ConnectTimeout) as e:
